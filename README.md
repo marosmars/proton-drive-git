@@ -1,12 +1,44 @@
 # proton-drive-git
 
-Use [Proton Drive](https://proton.me/drive) as a git remote.
+**TL;DR:** keep private repositories off GitHub, GitLab and every other code
+host, with no server of your own. Your repo lives as one end-to-end encrypted
+file in your Proton Drive, and `git push`, `git pull` and `git clone` work as
+usual.
 
 ```sh
 git remote add proton proton::/my-files/git/myrepo.bundle
 git push proton main
 git clone proton::/my-files/git/myrepo.bundle
 ```
+
+## Why
+
+Some repositories should never sit on a third-party code host: company
+records, client work under NDA, personal notes, infrastructure config,
+research before publication. The usual alternatives are a
+self-hosted server you must run and secure, or no remote at all.
+
+- **Fully private.** Proton Drive is end-to-end encrypted: Proton stores
+  ciphertext only. No code host can read, index, scan, or train AI models on
+  your code, because no code host is involved.
+- **No account sprawl.** No GitHub/GitLab organization, deploy keys, or
+  access tokens tied to the repo. Access is your Proton login.
+- **No server to run.** No SSH box, Gitea, or bare repo on a NAS to patch and
+  back up. If you have a Proton account, you already have the remote.
+- **Jurisdiction.** Data sits with a Switzerland-based provider instead of a
+  US code host, which can matter for GDPR or client confidentiality terms.
+- **Off-site backup for local-only repos.** Things that never belonged on a
+  code host but should not live on one laptop either.
+- **Private sharing.** Invite someone to the folder as viewer (clone/fetch)
+  or editor (push). No public URL, no extra accounts or keys.
+- **History of the remote itself.** Every push is a new Proton file revision,
+  so even a bad force-push can be rolled back from the Drive UI.
+
+What Proton can still see: that an encrypted file exists, its size, and when
+it changes. Not its name, content, or your commits.
+
+**Not for:** large repositories (every push uploads the whole repo), busy
+teams pushing concurrently, or workflows that need pull requests and CI.
 
 An unofficial [git remote helper](https://git-scm.com/docs/gitremote-helpers)
 built on the official [Proton Drive CLI](https://proton.me/support/drive-cli)
