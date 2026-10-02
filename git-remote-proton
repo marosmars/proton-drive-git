@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""Git remote helper: Proton Drive as a git remote.
+
+The remote is one git bundle file on Proton Drive. Every push rebuilds the
+bundle from all refs and uploads it as a new revision, so Proton's revision
+history doubles as a push log.
+
+    git remote add proton proton::/my-files/git/myrepo.bundle
+    git push proton master
+    git clone proton::/my-files/git/myrepo.bundle
+
+Install: symlink this file onto PATH as `git-remote-proton`.
+Needs the official `proton-drive` CLI, logged in. It is looked up on PATH;
+set PROTON_DRIVE_CLI to use another binary.
+
+Push is guarded against lost updates: if the bundle on Proton changed
+between the ref listing and the upload, the push is rejected (fetch first).
+"""
+
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+CACHE_ROOT = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "git-remote-proton"
+CLI = os.environ.get("PROTON_DRIVE_CLI", "proton-drive")
+
+
+class NotFound(RuntimeError):
+    """The Proton path does not exist (as opposed to any other CLI failure)."""
+
+
+def log(msg):
+    print(f"proton: {msg}", file=sys.stderr)
+
+
+def run(*cmd, check=True):
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if check and r.returncode != 0:
+        raise RuntimeError(f"{' '.join(map(str, cmd))} failed:\n{r.stderr or r.stdout}")
+    return r
+
+
+def drive(*args, json_out=False):
+    r = run(CLI, *args, *(["-j"] if json_out else []), check=False)
+    if r.returncode != 0:
+        msg = (r.stderr or r.stdout).strip()
+        if msg.startswith("Node not found"):
+            raise NotFound(msg)
+        raise RuntimeError(f"{CLI} {' '.join(args)} failed:\n{msg}")
+    return json.loads(r.stdout) if json_out else r.stdout
+
+
+class Remote:
+    def __init__(self, url):
+        path = url.removeprefix("proton://")
+        if not path.startswith("/") or not path.endswith(".bundle"):
+            sys.exit(f"proton: remote must be an absolute Proton path ending in .bundle, got {url!r}")
+        self.path = path
+        self.parent, _, self.name = path.rpartition("/")
+        self.cache = CACHE_ROOT / hashlib.sha1(path.encode()).hexdigest()[:16]
+        self.cache.mkdir(parents=True, exist_ok=True)
+        self.bundle = self.cache / self.name
+        self.listed = None  # (revision uid, sha1) seen by list; None = no bundle yet
+
+    def state(self):
+        """(revision uid, sha1 or None) of the bundle on Proton, None if absent.
+
+        Only a "Node not found" counts as absent; any other CLI failure
+        (login expired, network) raises, so it can never look like an
+        empty remote.
+        """
+        try:
+            nodes = drive("fs", "list", self.parent, json_out=True)
+        except NotFound:
+            return None
+        for n in nodes:
+            if n["type"] == "file" and n["name"].get("value") == self.name:
+                rev = n.get("activeRevision") or {}
+                return rev["uid"], (rev.get("claimedDigests") or {}).get("sha1")
+        return None
+
+    def download(self):
+        self.listed = self.state()
+        if self.listed is None:
+            return False
+        sha1 = self.listed[1]
+        if sha1 and self.bundle.exists() and file_sha1(self.bundle) == sha1:
+            return True  # cached copy is current
+        log(f"downloading {self.path}")
+        with tempfile.TemporaryDirectory(dir=self.cache) as tmp:
+            drive("fs", "download", "-f", "remove", self.path, tmp)
+            got = Path(tmp) / self.name
+            if sha1 and file_sha1(got) != sha1:
+                raise RuntimeError(f"downloaded bundle does not match Proton's SHA-1 {sha1}; retry")
+            os.replace(got, self.bundle)
+        return True
+
+    def ensure_parent(self):
+        parts = [p for p in self.parent.split("/") if p]
+        # parts[0] is the section (my-files); create folders below it
+        for i in range(2, len(parts) + 1):
+            here, up = "/" + "/".join(parts[:i]), "/" + "/".join(parts[:i - 1])
+            try:
+                drive("fs", "info", here)
+            except NotFound:
+                drive("fs", "create-folder", up, parts[i - 1])
+
+    def upload(self, local_bundle):
+        self.ensure_parent()
+        log(f"uploading {self.path}")
+        drive("fs", "upload", "-f", "create-new-revision", "-t", str(local_bundle), self.parent)
+
+
+def file_sha1(path):
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def bundle_heads(bundle):
+    return [line.split(" ", 1) for line in run("git", "bundle", "list-heads", str(bundle)).stdout.splitlines()]
+
+
+def cmd_list(remote, out):
+    if remote.download():
+        heads = bundle_heads(remote.bundle)
+        refs = {ref: sha for sha, ref in heads}
+        for sha, ref in heads:
+            if ref != "HEAD":
+                out.write(f"{sha} {ref}\n")
+        # bundles store HEAD as a bare hash; report it as a symref so clone
+        # checks out the right branch. Prefer main/master when tied.
+        if "HEAD" in refs:
+            tied = [r for r, s in refs.items() if s == refs["HEAD"] and r.startswith("refs/heads/")]
+            tied.sort(key=lambda r: (r not in ("refs/heads/main", "refs/heads/master"), r))
+            out.write(f"@{tied[0]} HEAD\n" if tied else f"{refs['HEAD']} HEAD\n")
+    out.write("\n")
+
+
+def cmd_fetch(remote, out, git_dir):
+    # unbundle stores the pack without touching refs; git updates refs itself
+    run("git", "--git-dir", git_dir, "bundle", "unbundle", str(remote.bundle))
+    out.write("\n")
+
+
+def cmd_push(remote, specs, out, git_dir):
+    with tempfile.TemporaryDirectory(dir=remote.cache) as tmp:
+        push_via(Path(tmp), remote, specs, out, git_dir)
+
+
+def push_via(tmp, remote, specs, out, git_dir):
+    bare = tmp / "bare.git"
+    run("git", "init", "-q", "--bare", str(bare))
+    if remote.listed is not None:
+        run("git", "--git-dir", str(bare), "fetch", "-q", str(remote.bundle), "+refs/*:refs/*")
+
+    results, changed = [], False
+    for spec in specs:
+        dst = spec.split(":", 1)[1]
+        r = run("git", "--git-dir", git_dir, "push", "--porcelain", str(bare), spec, check=False)
+        if r.returncode == 0:
+            results.append(f"ok {dst}")
+            changed = True
+        else:
+            # porcelain: "!<TAB>src:dst<TAB>[rejected] (fetch first)"
+            bad = [l.split("\t") for l in r.stdout.splitlines() if l.startswith("!\t")]
+            reason = bad[0][2].split("(", 1)[-1].rstrip(")") if bad and len(bad[0]) > 2 else "push failed"
+            results.append(f"error {dst} {reason}")
+
+    if changed:
+        heads = run("git", "--git-dir", str(bare), "for-each-ref", "--format=%(refname)", "refs/heads").stdout.split()
+        tags = run("git", "--git-dir", str(bare), "for-each-ref", "--format=%(refname)", "refs/tags").stdout.split()
+        if not heads and not tags:
+            results = [f"error {s.split(':', 1)[1]} cannot delete the last ref" for s in specs]
+        elif remote.state() != remote.listed:
+            results = [f"error {s.split(':', 1)[1]} fetch first" for s in specs]
+            log("bundle on Proton changed during push; fetch and retry")
+        else:
+            head = run("git", "--git-dir", git_dir, "symbolic-ref", "-q", "HEAD", check=False).stdout.strip()
+            if head in heads:
+                run("git", "--git-dir", str(bare), "symbolic-ref", "HEAD", head)
+            elif heads:
+                run("git", "--git-dir", str(bare), "symbolic-ref", "HEAD", heads[0])
+            up = tmp / "up"
+            up.mkdir()
+            new = up / remote.name
+            run("git", "--git-dir", str(bare), "bundle", "create", "-q", str(new), "--all")
+            remote.upload(new)
+            os.replace(new, remote.bundle)
+
+    for line in results:
+        out.write(line + "\n")
+    out.write("\n")
+
+
+def main():
+    if len(sys.argv) < 3:
+        sys.exit("usage: git-remote-proton <remote> <url>  (invoked by git)")
+    remote = Remote(sys.argv[2])
+    git_dir = os.environ.get("GIT_DIR", ".git")
+    out = sys.stdout
+    lines = iter(sys.stdin.readline, "")
+
+    for line in lines:
+        line = line.rstrip("\n")
+        if line == "":
+            break
+        if line == "capabilities":
+            out.write("fetch\npush\noption\n\n")
+        elif line.startswith("option"):
+            out.write("unsupported\n")
+        elif line in ("list", "list for-push"):
+            cmd_list(remote, out)
+        elif line.startswith("fetch "):
+            while next(lines, "\n").strip():
+                pass  # all fetch lines come in one batch; the bundle has everything
+            cmd_fetch(remote, out, git_dir)
+        elif line.startswith("push "):
+            specs = [line[5:]]
+            for more in lines:
+                more = more.strip()
+                if not more:
+                    break
+                specs.append(more[5:])
+            cmd_push(remote, specs, out, git_dir)
+        else:
+            sys.exit(f"proton: unknown command {line!r}")
+        out.flush()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except RuntimeError as e:
+        sys.exit(f"proton: {e}")
